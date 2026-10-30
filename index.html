@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#090D16" />
+    <meta
+      name="description"
+      content="SPORE — a single-file, censorship-resistant, peer-to-peer publishing protocol. Parasitic PNG carriers, Hydra receipts, Web-of-Trust and Dandelion++ routing."
+    />
+    <title>SPORE — sovereign field node</title>
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="command-bar">
+        <div class="brand-block">
+          <span class="brand-mark" aria-hidden="true">✳</span>
+          <div class="brand-copy">
+            <h1>SPORE</h1>
+            <p>sovereign field node · phase 05</p>
+          </div>
+        </div>
+
+        <div id="node-pill" class="node-pill" data-state="offline">
+          <span class="node-dot" aria-hidden="true"></span>
+          <span class="node-copy">
+            <strong id="node-status-text">OFFLINE</strong>
+            <span class="node-sub">zero requests at boot</span>
+          </span>
+        </div>
+
+        <dl class="node-stats" aria-label="Node status">
+          <div>
+            <dt>peers</dt>
+            <dd id="peers-stat">0</dd>
+          </div>
+          <div>
+            <dt>relays</dt>
+            <dd id="relays-stat">0</dd>
+          </div>
+          <div>
+            <dt>storage</dt>
+            <dd id="storage-mode">…</dd>
+          </div>
+        </dl>
+
+        <div class="channel-switcher">
+          <label for="topics">channel / room</label>
+          <div class="channel-row">
+            <input
+              id="topics"
+              class="mono"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="global + poetry, berlin"
+            />
+            <button id="mesh-connect" class="solid small" type="button">join</button>
+            <button id="mesh-disconnect" class="ghost small" type="button">leave</button>
+          </div>
+          <span id="mesh-status" class="mesh-status">offline · zero requests</span>
+        </div>
+
+        <div class="command-actions">
+          <button id="import-stego" class="ghost" type="button">Import Stego PNG</button>
+          <input id="stego-file" type="file" accept="image/png,image/*" hidden />
+          <button id="export-quine" class="ghost" type="button">
+            Export Self-Replicating Quine (.html)
+          </button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside class="sidebar sidebar-left" aria-label="Identity and trust">
+          <section class="panel identity-panel">
+            <div class="panel-head">
+              <h2>Identity</h2>
+              <span class="tag liveness">ephemeral</span>
+            </div>
+            <p class="fingerprint" id="fingerprint">spore:0x…</p>
+            <div class="key-row">
+              <code id="pubkey" class="pubkey">…</code>
+              <button id="copy-pubkey" class="ghost small" type="button">copy</button>
+            </div>
+            <p class="hint">secp256k1 · BIP340 Schnorr · generated locally. Nothing leaves this tab.</p>
+            <div class="actions">
+              <button id="open-identity" class="solid small" type="button">key vault</button>
+              <button id="rotate" class="ghost small" type="button">rotate</button>
+            </div>
+            <p class="status" id="identity-status" aria-live="polite"></p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Web of Trust</h2>
+              <span class="tag" id="trust-root">root</span>
+            </div>
+            <div class="filter-stack" role="group" aria-label="Feed filter">
+              <button id="filter-all" class="filter-button is-active" type="button">
+                All Verified
+              </button>
+              <button id="filter-2hop" class="filter-button" type="button">
+                2-Hop Trusted Only
+              </button>
+              <button id="filter-pow" class="filter-button" type="button">High PoW Only</button>
+            </div>
+            <label for="trust-pubkey">Vouch / mute pubkey</label>
+            <input
+              id="trust-pubkey"
+              class="mono"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="64 hex characters"
+            />
+            <div class="actions">
+              <button id="vouch-pubkey" class="solid small" type="button">vouch</button>
+              <button id="mute-pubkey" class="ghost small danger" type="button">mute</button>
+            </div>
+            <p class="status" id="trust-status" aria-live="polite"></p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Mesh</h2>
+              <span class="tag" id="peer-count">0</span>
+            </div>
+            <p class="hint" id="mesh-summary">
+              Signaling is off until you join. Peers are discovered simultaneously over public
+              Nostr relays and BitTorrent trackers, then talk directly over WebRTC.
+            </p>
+            <ul id="peer-list" class="peer-list">
+              <li class="peer-empty">no peers connected</li>
+            </ul>
+            <p class="status" id="mesh-note" aria-live="polite"></p>
+            <button id="open-manual" class="ghost small wide" type="button">
+              Open WebRTC peer bridge
+            </button>
+          </section>
+
+          <section class="panel storage-panel">
+            <div class="panel-head">
+              <h2>Storage</h2>
+              <span class="tag">local first</span>
+            </div>
+            <p class="status" id="store-status">booting storage…</p>
+            <p class="hint">IndexedDB → localStorage → memory. The quine snapshot is public data only.</p>
+          </section>
+        </aside>
+
+        <main class="center-column">
+          <section class="panel composer-panel" aria-labelledby="compose-title">
+            <div class="panel-head">
+              <h2 id="compose-title">Transmit</h2>
+              <span class="tag">hashcash + schnorr</span>
+            </div>
+
+            <div class="mode-toggle" role="group" aria-label="Composer mode">
+              <button id="mode-post" class="mode-button is-active" type="button">
+                Standard Post
+              </button>
+              <button id="mode-receipt" class="mode-button" type="button">
+                Hydra Censorship Receipt
+              </button>
+            </div>
+
+            <div id="post-fields">
+              <label for="content">Packet content</label>
+              <textarea
+                id="content"
+                maxlength="65536"
+                placeholder="Say the thing that cannot be unsaid."
+                spellcheck="false"
+              ></textarea>
+            </div>
+
+            <div id="receipt-fields" hidden>
+              <p class="hint receipt-hint">
+                Anchor an external post and commit to the SHA-256 digest of its original media or
+                text. The signed timestamp proves prior possession even after a takedown.
+              </p>
+              <label for="receipt-url">External post URL</label>
+              <input
+                id="receipt-url"
+                class="mono"
+                type="url"
+                spellcheck="false"
+                autocomplete="off"
+                placeholder="https://instagram.com/p/… · youtube.com/watch?v=… · x.com/…/status/…"
+              />
+              <label for="receipt-source">Original text (or choose media below)</label>
+              <textarea
+                id="receipt-source"
+                class="receipt-source"
+                maxlength="65536"
+                spellcheck="false"
+                placeholder="Paste the original caption or text that was published externally."
+              ></textarea>
+              <div class="receipt-file-row">
+                <label for="receipt-file" class="file-label">Original media</label>
+                <input id="receipt-file" type="file" />
+                <button id="receipt-clear" class="ghost small" type="button">clear</button>
+              </div>
+              <div class="digest-row">
+                <span class="digest-label">source sha256</span>
+                <code id="receipt-digest" class="digest-value">not computed</code>
+              </div>
+              <label for="receipt-note">Receipt note (optional)</label>
+              <input
+                id="receipt-note"
+                type="text"
+                maxlength="280"
+                spellcheck="false"
+                placeholder="why this artifact matters"
+              />
+              <p class="status" id="receipt-status" aria-live="polite"></p>
+            </div>
+
+            <div class="pow-block">
+              <div class="pow-head">
+                <label for="pow-bits">Proof of work</label>
+                <output id="pow-output" for="pow-bits">16 bits · ~65,536 hashes</output>
+              </div>
+              <input id="pow-bits" type="range" min="8" max="20" step="1" value="16" />
+              <div class="pow-foot">
+                <span class="live-rate" id="pow-rate">idle · 0 h/s</span>
+                <label class="toggle-row" for="dandelion-toggle">
+                  <input id="dandelion-toggle" type="checkbox" checked />
+                  <span class="toggle-track" aria-hidden="true"></span>
+                  <span>Dandelion++ Stem Routing</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="actions">
+              <button id="seal" class="solid" type="button">mine &amp; seal post</button>
+              <button id="cancel" class="ghost" type="button" hidden>cancel</button>
+            </div>
+            <div class="progress" aria-hidden="true"><div id="progress-bar"></div></div>
+            <p class="status" id="mine-status" aria-live="polite"></p>
+
+            <article id="packet-result" class="result" hidden>
+              <div class="result-head">
+                <span class="verdict" id="verdict">verified</span>
+                <button id="copy-packet" class="ghost small" type="button">copy JSON</button>
+              </div>
+              <dl>
+                <dt>id</dt>
+                <dd><code id="result-id"></code></dd>
+                <dt>work</dt>
+                <dd id="result-pow"></dd>
+                <dt>mined in</dt>
+                <dd id="result-time"></dd>
+                <dt>signature</dt>
+                <dd><code id="result-sig"></code></dd>
+              </dl>
+              <pre id="result-json" class="mono"></pre>
+            </article>
+          </section>
+
+          <section class="panel feed-panel" aria-labelledby="feed-title">
+            <div class="panel-head">
+              <h2 id="feed-title">Field Feed</h2>
+              <div class="feed-tools">
+                <span class="tag" id="feed-count">loading packets…</span>
+              </div>
+            </div>
+            <p class="status stego-status" id="stego-status" aria-live="polite"></p>
+            <div id="feed" class="feed"></div>
+            <p class="status" id="feed-status" aria-live="polite"></p>
+          </section>
+        </main>
+
+        <aside class="sidebar sidebar-right" aria-label="Protocol trace and adversarial tests">
+          <section class="panel trace-panel">
+            <div class="panel-head">
+              <h2>Protocol Trace</h2>
+              <div class="feed-tools">
+                <span class="tag" id="telemetry-count">0 events</span>
+                <button id="telemetry-clear" class="ghost small" type="button">clear</button>
+              </div>
+            </div>
+            <div class="trace-legend" aria-hidden="true">
+              <span data-tone="stem">STEM</span>
+              <span data-tone="fluff">FLUFF</span>
+              <span data-tone="sync">SYNC</span>
+              <span data-tone="verified">VERIFIED</span>
+              <span data-tone="drop">DROP</span>
+            </div>
+            <ol id="telemetry-list" class="telemetry-list" aria-live="polite">
+              <li class="telemetry-empty">no events yet</li>
+            </ol>
+          </section>
+
+          <section class="panel adversarial-panel">
+            <div class="panel-head">
+              <h2>Adversarial Tests</h2>
+              <span class="tag danger">live</span>
+            </div>
+            <p class="hint">
+              Local proofs. Each probe runs the same verification gates as the network and logs the
+              outcome in the trace above.
+            </p>
+            <div class="adversarial-stack">
+              <button id="attack-tamper" class="ghost danger" type="button">
+                Inject Tampered Signature Packet
+              </button>
+              <button id="attack-sybil" class="ghost" type="button">
+                Inject Zero-Work Sybil Spam
+              </button>
+              <button id="attack-stem" class="ghost" type="button">
+                Simulate Dandelion++ Stem Hop
+              </button>
+            </div>
+            <p class="status" id="adversary-status" aria-live="polite"></p>
+          </section>
+
+          <section class="panel legend-panel">
+            <div class="panel-head">
+              <h2>Signal Key</h2>
+            </div>
+            <ul class="signal-key">
+              <li><span class="swatch emerald"></span> verified · admitted</li>
+              <li><span class="swatch amber"></span> stem · in flight</li>
+              <li><span class="swatch red"></span> tamper · dropped</li>
+            </ul>
+            <p class="hint">
+              The image is the carrier. Import a SPOR PNG to verify and merge its signed packet
+              bundle without any server.
+            </p>
+          </section>
+        </aside>
+      </div>
+
+      <footer class="site-footer">
+        <span>one file · zero external requests at boot · file:// ready</span>
+        <span class="dot" aria-hidden="true">·</span>
+        <span>phase 5 of 6</span>
+      </footer>
+    </div>
+
+    <dialog id="identity-modal" class="modal">
+      <div class="modal-head">
+        <h2>Key Vault</h2>
+        <button id="close-identity" class="ghost small" type="button">close</button>
+      </div>
+      <p class="hint">
+        PBKDF2-HMAC-SHA256 (210k rounds) → XChaCha20-Poly1305. Backup JSON is safe to paste into a
+        notes app; the passphrase never leaves this tab.
+      </p>
+      <label for="backup-pass">Backup passphrase</label>
+      <input
+        id="backup-pass"
+        type="password"
+        autocomplete="new-password"
+        spellcheck="false"
+        placeholder="long, unique, memorable"
+      />
+      <div class="actions">
+        <button id="encrypt-key" class="solid small" type="button">encrypt key</button>
+        <button id="restore-toggle" class="ghost small" type="button">restore…</button>
+      </div>
+      <textarea
+        id="backup-json"
+        class="mono"
+        spellcheck="false"
+        placeholder="Encrypted key backup JSON appears here"
+        aria-label="Encrypted key backup JSON"
+      ></textarea>
+      <div id="restore-box" hidden>
+        <label for="restore-pass">Passphrase for restore</label>
+        <input
+          id="restore-pass"
+          type="password"
+          autocomplete="current-password"
+          spellcheck="false"
+          placeholder="passphrase used at backup time"
+        />
+        <div class="actions">
+          <button id="restore-key" class="solid small" type="button">decrypt &amp; adopt key</button>
+        </div>
+      </div>
+      <p class="status" id="backup-status" aria-live="polite"></p>
+    </dialog>
+
+    <dialog id="manual-box" class="modal">
+      <div class="modal-head">
+        <h2>Direct SDP Bridge</h2>
+        <button id="close-manual" class="ghost small" type="button">close</button>
+      </div>
+      <p class="hint">
+        No trackers, no STUN. Create an invite, send the <code class="inline">spore-peer://…</code>
+        code over any messenger, then paste the answer back. Useful on the same Wi-Fi or when public
+        signaling is blocked.
+      </p>
+      <label for="manual-code">Invite / answer code</label>
+      <textarea
+        id="manual-code"
+        class="mono"
+        spellcheck="false"
+        autocomplete="off"
+        placeholder="spore-peer://…"
+        aria-label="Manual SDP invite or answer code"
+      ></textarea>
+      <div class="actions">
+        <button id="manual-offer" class="solid small" type="button">create invite</button>
+        <button id="manual-accept" class="ghost small" type="button">accept invite</button>
+        <button id="manual-answer" class="ghost small" type="button">apply answer</button>
+        <button id="manual-copy" class="ghost small" type="button">copy code</button>
+      </div>
+      <p class="status" id="manual-status" aria-live="polite"></p>
+    </dialog>
+
+    <script id="spore-quine-state" type="application/json"></script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -5,6 +5,8 @@
 ### Self-Propagating Overlay for Resilient Expression
 **No origin server to seize. No app-store listing to remove. No account to suspend.**
 
+[![Download SPORE — index.html](https://img.shields.io/badge/Download_SPORE-index.html-00F59B?style=for-the-badge&labelColor=090D16&logo=html5&logoColor=090D16)](https://github.com/ayush6288/spore/releases/latest/download/index.html)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-00F59B)](LICENSE)
 ![Build: single-file HTML](https://img.shields.io/badge/Build-Single--file_HTML-090D16)
 ![Crypto: secp256k1 Schnorr + Hashcash](https://img.shields.io/badge/Crypto-secp256k1_Schnorr_%2B_Hashcash-FFB800)

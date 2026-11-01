@@ -35,7 +35,36 @@ export const DEFAULT_POW_BITS = 16;
 export const MAX_CONTENT_BYTES = 64 * 1024;
 export const MAX_REFERENCE_BYTES = 256;
 export const MAX_HOP_COUNT = 255;
-export const MAX_PACKET_JSON_CHARS = 2_000_000;
+export const MAX_PACKET_JSON_CHARS = 3_000_000;
+
+/** Video manifests are content-addressed by `media_id` (SHA-256 of the file). */
+export const MAX_MEDIA_BYTES = 512 * 1024 * 1024;
+export const MAX_MEDIA_CHUNKS = 8_192;
+export const MAX_MEDIA_CHUNK_SIZE = 1024 * 1024;
+export const MAX_INLINE_MEDIA_BYTES = 1_500_000;
+export const MAX_INLINE_MEDIA_B64_CHARS = 2_100_000;
+export const MAX_MEDIA_FILE_NAME_BYTES = 255;
+export const MAX_MEDIA_MIME_BYTES = 128;
+export const MAX_MEDIA_SOURCE_URL_BYTES = 2_048;
+
+export interface MediaManifest {
+  /** SHA-256 hex of the full video binary. */
+  media_id: string;
+  file_name: string;
+  /** e.g. `video/mp4`, `video/webm`. */
+  mime: string;
+  /** Total byte length. */
+  size: number;
+  /** Default 65,536 (64 KiB). */
+  chunk_size: number;
+  total_chunks: number;
+  /** SHA-256 hex of each chunk, in order. */
+  chunk_hashes: string[];
+  /** Original Instagram Reel / X / YouTube URL. */
+  source_url?: string;
+  /** Optional inline video bytes for small clips (<= 1.5 MB). */
+  inline_data_b64?: string;
+}
 
 export interface SporePacket {
   /** 32-byte SHA-256 packet id, hex. */
@@ -48,6 +77,12 @@ export interface SporePacket {
   content: string;
   /** Content-addressed media reference (CID / blob hash). */
   media_cid?: string;
+  /**
+   * Optional chunked-media manifest. `media_cid` is the signed trust anchor:
+   * every chunk and the assembled blob are verified against `media_id`, so a
+   * relay cannot substitute bytes without failing the hash gates.
+   */
+  media_manifest?: MediaManifest;
   /** Parent packet id for replies. */
   reply_to?: string;
   pow_nonce: number;
@@ -86,6 +121,7 @@ export interface PacketDraft {
   content: string;
   created_at?: number;
   media_cid?: string;
+  media_manifest?: MediaManifest;
   reply_to?: string;
   hop_count?: number;
   dandelion_phase?: DandelionPhase;
@@ -150,7 +186,22 @@ const REQUIRED_KEYS = [
   'sig',
 ] as const;
 
-const PACKET_KEYS = new Set<string>([...REQUIRED_KEYS, 'media_cid', 'reply_to']);
+const PACKET_KEYS = new Set<string>([...REQUIRED_KEYS, 'media_cid', 'media_manifest', 'reply_to']);
+
+const MANIFEST_KEYS = new Set<string>([
+  'media_id',
+  'file_name',
+  'mime',
+  'size',
+  'chunk_size',
+  'total_chunks',
+  'chunk_hashes',
+  'source_url',
+  'inline_data_b64',
+]);
+
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const MIME_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -187,6 +238,110 @@ function validateReference(value: unknown, label: string): string | undefined {
   return value;
 }
 
+/**
+ * Strictly validate a media manifest. Throws on malformed input, mirroring the
+ * draft validators; `verifyPacket` converts the throw into a schema failure.
+ */
+export function validateMediaManifest(value: unknown): MediaManifest {
+  if (!isRecord(value)) throw new TypeError('media_manifest must be an object');
+  for (const key of Object.keys(value)) {
+    if (!MANIFEST_KEYS.has(key)) {
+      throw new TypeError(`Unknown media_manifest field: ${key}`);
+    }
+  }
+
+  const mediaId = value['media_id'];
+  if (!isLowerHex(mediaId, 32)) {
+    throw new TypeError('media_manifest.media_id must be 32 bytes of lowercase hex');
+  }
+  const fileName = value['file_name'];
+  if (typeof fileName !== 'string' || fileName.length === 0) {
+    throw new TypeError('media_manifest.file_name must be a non-empty string');
+  }
+  if (utf8ByteLength(fileName) > MAX_MEDIA_FILE_NAME_BYTES) {
+    throw new RangeError(`media_manifest.file_name exceeds ${MAX_MEDIA_FILE_NAME_BYTES} UTF-8 bytes`);
+  }
+  if (/[\u0000-\u001f\u007f]/.test(fileName)) {
+    throw new TypeError('media_manifest.file_name contains control characters');
+  }
+  const mime = value['mime'];
+  if (typeof mime !== 'string' || !MIME_RE.test(mime)) {
+    throw new TypeError('media_manifest.mime must be a valid media type');
+  }
+  if (utf8ByteLength(mime) > MAX_MEDIA_MIME_BYTES) {
+    throw new RangeError(`media_manifest.mime exceeds ${MAX_MEDIA_MIME_BYTES} UTF-8 bytes`);
+  }
+  const size = value['size'];
+  if (!isSafeUint(size, MAX_MEDIA_BYTES) || size < 1) {
+    throw new RangeError(`media_manifest.size must be between 1 and ${MAX_MEDIA_BYTES}`);
+  }
+  const chunkSize = value['chunk_size'];
+  if (!isSafeUint(chunkSize, MAX_MEDIA_CHUNK_SIZE) || chunkSize < 1) {
+    throw new RangeError(
+      `media_manifest.chunk_size must be between 1 and ${MAX_MEDIA_CHUNK_SIZE}`,
+    );
+  }
+  const expectedChunks = Math.ceil(size / chunkSize);
+  const totalChunks = value['total_chunks'];
+  if (!isSafeUint(totalChunks, MAX_MEDIA_CHUNKS) || totalChunks < 1) {
+    throw new RangeError(`media_manifest.total_chunks must be between 1 and ${MAX_MEDIA_CHUNKS}`);
+  }
+  if (totalChunks !== expectedChunks) {
+    throw new RangeError('media_manifest.total_chunks does not match size / chunk_size');
+  }
+
+  const hashes = value['chunk_hashes'];
+  if (!Array.isArray(hashes) || hashes.length !== totalChunks) {
+    throw new TypeError('media_manifest.chunk_hashes must contain one hash per chunk');
+  }
+  for (const hash of hashes) {
+    if (!isLowerHex(hash, 32)) {
+      throw new TypeError('media_manifest.chunk_hashes entries must be 32 bytes of lowercase hex');
+    }
+  }
+
+  const sourceUrl = value['source_url'];
+  if (sourceUrl !== undefined) {
+    if (typeof sourceUrl !== 'string' || sourceUrl.length === 0) {
+      throw new TypeError('media_manifest.source_url must be a non-empty string when present');
+    }
+    if (utf8ByteLength(sourceUrl) > MAX_MEDIA_SOURCE_URL_BYTES) {
+      throw new RangeError(
+        `media_manifest.source_url exceeds ${MAX_MEDIA_SOURCE_URL_BYTES} UTF-8 bytes`,
+      );
+    }
+  }
+
+  const inline = value['inline_data_b64'];
+  if (inline !== undefined) {
+    if (typeof inline !== 'string' || inline.length === 0) {
+      throw new TypeError('media_manifest.inline_data_b64 must be a non-empty string when present');
+    }
+    if (size > MAX_INLINE_MEDIA_BYTES) {
+      throw new RangeError('inline media is only allowed for clips up to 1.5 MB');
+    }
+    if (inline.length > MAX_INLINE_MEDIA_B64_CHARS || !BASE64_RE.test(inline)) {
+      throw new TypeError('media_manifest.inline_data_b64 is not valid bounded base64');
+    }
+    const padded = Math.ceil(size / 3) * 4;
+    if (inline.length < padded - 2 || inline.length > padded) {
+      throw new RangeError('media_manifest.inline_data_b64 length does not match size');
+    }
+  }
+
+  return {
+    media_id: mediaId,
+    file_name: fileName,
+    mime,
+    size,
+    chunk_size: chunkSize,
+    total_chunks: totalChunks,
+    chunk_hashes: hashes.slice() as string[],
+    ...(sourceUrl !== undefined ? { source_url: sourceUrl } : {}),
+    ...(inline !== undefined ? { inline_data_b64: inline } : {}),
+  };
+}
+
 function validateContent(content: unknown, maxContentBytes: number): string {
   if (typeof content !== 'string') throw new TypeError('content must be a string');
   if (utf8ByteLength(content) > maxContentBytes) {
@@ -207,6 +362,7 @@ function validateDraft(draft: PacketDraft, maxContentBytes: number): {
   content: string;
   created_at: number;
   media_cid?: string;
+  media_manifest?: MediaManifest;
   reply_to?: string;
   hop_count: number;
   dandelion_phase: DandelionPhase;
@@ -215,7 +371,18 @@ function validateDraft(draft: PacketDraft, maxContentBytes: number): {
   if (!isKind(draft.kind)) throw new TypeError(`kind must be one of: ${PACKET_KINDS.join(', ')}`);
   const content = validateContent(draft.content, maxContentBytes);
   const created_at = draft.created_at === undefined ? Math.floor(Date.now() / 1000) : validateTimestamp(draft.created_at);
+  const media_manifest =
+    draft.media_manifest === undefined ? undefined : validateMediaManifest(draft.media_manifest);
   const media_cid = validateReference(draft.media_cid, 'media_cid');
+  if (
+    media_manifest !== undefined &&
+    media_cid !== undefined &&
+    media_cid !== media_manifest.media_id
+  ) {
+    throw new TypeError('media_cid must equal media_manifest.media_id when both are present');
+  }
+  // The signed media_cid is the trust anchor for the manifest.
+  const boundMediaCid = media_manifest?.media_id ?? media_cid;
   const reply_to = validateReference(draft.reply_to, 'reply_to');
   const hop_count = draft.hop_count ?? 0;
   if (!isSafeUint(hop_count, MAX_HOP_COUNT)) {
@@ -229,7 +396,8 @@ function validateDraft(draft: PacketDraft, maxContentBytes: number): {
     kind: draft.kind,
     content,
     created_at,
-    ...(media_cid !== undefined ? { media_cid } : {}),
+    ...(boundMediaCid !== undefined ? { media_cid: boundMediaCid } : {}),
+    ...(media_manifest !== undefined ? { media_manifest } : {}),
     ...(reply_to !== undefined ? { reply_to } : {}),
     hop_count,
     dandelion_phase,
@@ -344,6 +512,7 @@ export async function sealPacket(
     kind: fields.kind,
     content: fields.content,
     ...(fields.media_cid !== undefined ? { media_cid: fields.media_cid } : {}),
+    ...(fields.media_manifest !== undefined ? { media_manifest: fields.media_manifest } : {}),
     ...(fields.reply_to !== undefined ? { reply_to: fields.reply_to } : {}),
     pow_nonce: mined.nonce,
     pow_bits: powBits,
@@ -379,8 +548,21 @@ export function verifyPacket(
     if (!(key in value)) return fail('invalid-schema', `Missing packet field: ${key}`);
   }
 
-  const { id, pubkey, created_at, kind, content, media_cid, reply_to, pow_nonce, pow_bits, hop_count, dandelion_phase, sig } =
-    value;
+  const {
+    id,
+    pubkey,
+    created_at,
+    kind,
+    content,
+    media_cid,
+    media_manifest,
+    reply_to,
+    pow_nonce,
+    pow_bits,
+    hop_count,
+    dandelion_phase,
+    sig,
+  } = value;
 
   if (!isLowerHex(id, 32)) return fail('invalid-schema', 'id must be 32 bytes of lowercase hex');
   if (!isLowerHex(pubkey, 32)) return fail('invalid-schema', 'pubkey must be 32 bytes of lowercase hex');
@@ -405,6 +587,23 @@ export function verifyPacket(
   if (typeof reply_to === 'string' && utf8ByteLength(reply_to) > MAX_REFERENCE_BYTES) {
     return fail('invalid-schema', `reply_to exceeds ${MAX_REFERENCE_BYTES} UTF-8 bytes`);
   }
+  let manifest: MediaManifest | undefined;
+  if (media_manifest !== undefined) {
+    try {
+      manifest = validateMediaManifest(media_manifest);
+    } catch (error) {
+      return fail(
+        'invalid-schema',
+        error instanceof Error ? error.message : 'media_manifest is malformed',
+      );
+    }
+    if (media_cid === undefined) {
+      return fail('invalid-schema', 'media_manifest requires a media_cid binding');
+    }
+    if (media_cid !== manifest.media_id) {
+      return fail('invalid-schema', 'media_cid does not match media_manifest.media_id');
+    }
+  }
   if (!isSafeUint(pow_nonce, MAX_NONCE)) return fail('invalid-schema', 'pow_nonce must be a uint32');
   if (!isSafeUint(pow_bits, MAX_POW_BITS)) return fail('invalid-schema', 'pow_bits must be between 0 and 64');
   if (!isSafeUint(hop_count, MAX_HOP_COUNT)) return fail('invalid-schema', 'hop_count must be between 0 and 255');
@@ -419,6 +618,7 @@ export function verifyPacket(
     kind,
     content,
     ...(media_cid !== undefined ? { media_cid } : {}),
+    ...(manifest !== undefined ? { media_manifest: manifest } : {}),
     ...(reply_to !== undefined ? { reply_to } : {}),
     pow_nonce,
     pow_bits,
@@ -475,6 +675,9 @@ export function serializePacket(packet: SporePacket): string {
     kind: packet.kind,
     content: packet.content,
     ...(packet.media_cid !== undefined ? { media_cid: packet.media_cid } : {}),
+    ...(packet.media_manifest !== undefined
+      ? { media_manifest: packet.media_manifest }
+      : {}),
     ...(packet.reply_to !== undefined ? { reply_to: packet.reply_to } : {}),
     pow_nonce: packet.pow_nonce,
     pow_bits: packet.pow_bits,

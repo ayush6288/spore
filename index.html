@@ -18,7 +18,7 @@
           <span class="brand-mark" aria-hidden="true">✳</span>
           <div class="brand-copy">
             <h1>SPORE</h1>
-            <p>sovereign field node · phase 05</p>
+            <p>sovereign field node · phase 07</p>
           </div>
         </div>
 
@@ -70,6 +70,29 @@
           </button>
         </div>
       </header>
+
+      <section class="command-console" aria-label="Command console">
+        <form id="command-form" class="command-form" autocomplete="off">
+          <span class="command-prompt" aria-hidden="true">›</span>
+          <label class="sr-only" for="command-input">SPORE command</label>
+          <input
+            id="command-input"
+            class="mono"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="type /help · /join poetry · /post hello · /video · /guide"
+          />
+          <button id="command-run" class="solid small" type="submit">run</button>
+          <button id="open-guide" class="ghost small" type="button">guide</button>
+          <button id="toggle-advanced" class="ghost small" type="button" aria-pressed="true">
+            hide diagnostics
+          </button>
+        </form>
+        <p class="status command-status" id="command-status" aria-live="polite">
+          command console ready · type <code class="inline">/help</code> for the short list
+        </p>
+      </section>
 
       <div class="workspace">
         <aside class="sidebar sidebar-left" aria-label="Identity and trust">
@@ -173,6 +196,34 @@
                 placeholder="Say the thing that cannot be unsaid."
                 spellcheck="false"
               ></textarea>
+              <div class="video-attach">
+                <div class="video-attach-head">
+                  <span class="video-attach-label">Reel / video attachment</span>
+                  <span class="tag" id="video-attach-tag">none</span>
+                </div>
+                <div class="actions">
+                  <button id="import-video" class="ghost small" type="button">
+                    Import Reel Video
+                  </button>
+                  <button id="clear-video" class="ghost small danger" type="button" hidden>
+                    remove video
+                  </button>
+                  <input id="video-file" type="file" accept="video/*" hidden />
+                </div>
+                <p class="hint" id="video-hint">
+                  MP4 or WebM. Sliced into 64 KiB chunks, verified with SHA-256, and seeded to
+                  peers. Clips up to 1.5 MB also embed inline for zero-peer offline playback.
+                </p>
+                <p class="status" id="video-status" aria-live="polite"></p>
+                <video
+                  id="video-preview"
+                  class="video-preview"
+                  controls
+                  playsinline
+                  preload="metadata"
+                  hidden
+                ></video>
+              </div>
             </div>
 
             <div id="receipt-fields" hidden>
@@ -336,7 +387,7 @@
       <footer class="site-footer">
         <span>one file · zero external requests at boot · file:// ready</span>
         <span class="dot" aria-hidden="true">·</span>
-        <span>phase 5 of 6</span>
+        <span>phase 7 · video swarm</span>
       </footer>
     </div>
 
@@ -410,6 +461,29 @@
         <button id="manual-copy" class="ghost small" type="button">copy code</button>
       </div>
       <p class="status" id="manual-status" aria-live="polite"></p>
+    </dialog>
+
+    <dialog id="guide-modal" class="modal guide-modal" aria-labelledby="guide-title">
+      <div class="modal-head">
+        <div class="guide-heading">
+          <span class="tag" id="guide-step-count">1 / 9</span>
+          <h2 id="guide-title">Welcome to SPORE</h2>
+        </div>
+        <button id="close-guide" class="ghost small" type="button">close</button>
+      </div>
+      <div class="guide-progress" aria-hidden="true">
+        <div id="guide-progress-bar"></div>
+      </div>
+      <p class="guide-kicker" id="guide-kicker">STEP 1 · THE BASICS</p>
+      <div id="guide-body" class="guide-body"></div>
+      <div class="actions guide-actions">
+        <button id="guide-prev" class="ghost small" type="button">back</button>
+        <button id="guide-next" class="solid small" type="button">next</button>
+        <button id="guide-done" class="ghost small" type="button" hidden>
+          start publishing
+        </button>
+      </div>
+      <p class="status" id="guide-status" aria-live="polite"></p>
     </dialog>
 
     <script id="spore-quine-state" type="application/json"></script>

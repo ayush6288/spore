@@ -25,7 +25,26 @@ import type {
   MessageAction,
   Room,
 } from 'trystero/nostr';
-import { WIRE_ACTION } from './protocol';
+import {
+  MAX_MEDIA_REQUEST_CHUNKS,
+  WIRE_ACTION,
+  encodeWireMessage,
+  type MediaChunkMessage,
+  type MediaHaveMessage,
+  type MediaMessage,
+  type MediaReqMessage,
+} from './protocol';
+import type { MediaManifest } from '../crypto/packet';
+import {
+  assembleVideoBlob,
+  availableChunks,
+  base64ToBytes as decodeBase64,
+  bytesToBase64 as encodeBase64,
+  defaultVideoCache,
+  hasCompleteMedia,
+  verifyAndStoreChunk,
+  type VideoChunkCache,
+} from '../media/videoSwarm';
 import type { MeshPeerInfo, MeshTransportKind, OutboundMesh } from './transport';
 
 export const DEFAULT_APP_ID = 'spore-v1';
@@ -1013,4 +1032,368 @@ export class Swarm implements OutboundMesh {
       }
     }
   }
+}
+
+/* ------------------------------------------------------------------ media */
+
+export interface MediaSwarmOptions {
+  readonly transport: OutboundMesh;
+  readonly cache?: VideoChunkCache;
+  readonly now?: () => number;
+  /** Abandon an unanswered chunk request after this long. */
+  readonly requestTimeoutMs?: number;
+  /** Chunks per MEDIA_REQ. The protocol caps this at six. */
+  readonly requestWindow?: number;
+  readonly onManifest?: (manifest: MediaManifest, peerId?: string) => void;
+  readonly onProgress?: (
+    manifest: MediaManifest,
+    available: readonly number[],
+    total: number,
+  ) => void;
+  readonly onComplete?: (manifest: MediaManifest, blob: Blob) => void;
+  readonly onError?: (message: string, mediaId?: string) => void;
+}
+
+interface MediaInflight {
+  readonly peerId: string;
+  readonly at: number;
+  attempts: number;
+}
+
+/**
+ * Chunk exchange over the same encrypted DataChannels as packet gossip.
+ *
+ * Peers announce available chunk indices, request small windows, and verify
+ * every response against the manifest before storing it. The coordinator is
+ * transport-agnostic: `OutboundMesh` supplies send/broadcast/peerIds, so the
+ * manual SDP bridge and both signaling strategies all work unchanged.
+ */
+export class MediaSwarm {
+  private readonly transport: OutboundMesh;
+  private readonly cache: VideoChunkCache;
+  private readonly now: () => number;
+  private readonly requestTimeoutMs: number;
+  private readonly requestWindow: number;
+  private readonly onManifest: ((manifest: MediaManifest, peerId?: string) => void) | undefined;
+  private readonly onProgress:
+    | ((manifest: MediaManifest, available: readonly number[], total: number) => void)
+    | undefined;
+  private readonly onComplete: ((manifest: MediaManifest, blob: Blob) => void) | undefined;
+  private readonly onError: ((message: string, mediaId?: string) => void) | undefined;
+
+  private readonly manifests = new Map<string, MediaManifest>();
+  private readonly peerAvailability = new Map<string, Map<string, Set<number>>>();
+  private readonly inflight = new Map<string, Map<number, MediaInflight>>();
+  private readonly completed = new Set<string>();
+  private readonly refreshing = new Set<string>();
+  private readonly announced = new Map<string, string>();
+  private readonly timer: ReturnType<typeof setInterval>;
+
+  constructor(options: MediaSwarmOptions) {
+    this.transport = options.transport;
+    this.cache = options.cache ?? defaultVideoCache;
+    this.now = options.now ?? Date.now;
+    this.requestTimeoutMs = Math.max(1_000, options.requestTimeoutMs ?? 12_000);
+    const window = options.requestWindow ?? 4;
+    if (!Number.isSafeInteger(window) || window < 1 || window > MAX_MEDIA_REQUEST_CHUNKS) {
+      throw new RangeError(`requestWindow must be between 1 and ${MAX_MEDIA_REQUEST_CHUNKS}`);
+    }
+    this.requestWindow = window;
+    this.onManifest = options.onManifest;
+    this.onProgress = options.onProgress;
+    this.onComplete = options.onComplete;
+    this.onError = options.onError;
+    this.timer = setInterval(() => this.tick(), 1_000);
+    const maybeUnref = this.timer as unknown as { unref?: () => void };
+    maybeUnref.unref?.();
+  }
+
+  get manifestCount(): number {
+    return this.manifests.size;
+  }
+
+  registerManifest(manifest: MediaManifest): void {
+    if (!this.manifests.has(manifest.media_id)) {
+      this.manifests.set(manifest.media_id, manifest);
+      this.onManifest?.(manifest);
+    }
+  }
+
+  /** Broadcast local availability plus the manifest peers need to verify it. */
+  async announce(manifest: MediaManifest): Promise<number[]> {
+    this.registerManifest(manifest);
+    const available = await availableChunks(manifest, this.cache);
+    this.emitProgress(manifest, available);
+    if (available.length === 0) return available;
+    const signature = available.join(',');
+    if (this.announced.get(manifest.media_id) === signature) return available;
+    this.announced.set(manifest.media_id, signature);
+    const message: MediaHaveMessage = {
+      v: 1,
+      t: 'MEDIA_HAVE',
+      media_id: manifest.media_id,
+      available_chunks: available,
+      manifest: wireManifest(manifest),
+    };
+    this.transport.broadcast(encodeWireMessage(message));
+    return available;
+  }
+
+  async announceAll(manifests: readonly MediaManifest[]): Promise<void> {
+    for (const manifest of manifests) {
+      await this.announce(manifest);
+    }
+  }
+
+  onPeerJoin(peerId: string): void {
+    if (!this.transport.peerIds().includes(peerId)) return;
+    for (const manifest of this.manifests.values()) {
+      void this.sendHave(peerId, manifest).then(() => this.requestMissing(manifest));
+    }
+  }
+
+  onPeerLeave(peerId: string): void {
+    for (const peers of this.peerAvailability.values()) {
+      peers.delete(peerId);
+    }
+    for (const [mediaId, pending] of this.inflight) {
+      for (const [index, record] of [...pending]) {
+        if (record.peerId === peerId) pending.delete(index);
+      }
+      if (pending.size === 0) this.inflight.delete(mediaId);
+    }
+  }
+
+  /** Returns true when the message belongs to the media protocol. */
+  handleMessage(peerId: string, message: MediaMessage): boolean {
+    switch (message.t) {
+      case 'MEDIA_HAVE':
+        this.absorbHave(peerId, message);
+        return true;
+      case 'MEDIA_REQ':
+        void this.serveRequest(peerId, message);
+        return true;
+      case 'MEDIA_CHUNK':
+        void this.absorbChunk(peerId, message);
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /** Kick off a fetch for every registered incomplete manifest. */
+  async requestAll(): Promise<void> {
+    for (const manifest of this.manifests.values()) {
+      await this.requestMissing(manifest);
+    }
+  }
+
+  /** Register and ask known peers for any missing chunks. */
+  request(manifest: MediaManifest): void {
+    this.registerManifest(manifest);
+    void this.requestMissing(manifest);
+  }
+
+  stop(): void {
+    clearInterval(this.timer);
+    this.inflight.clear();
+    this.refreshing.clear();
+    this.peerAvailability.clear();
+  }
+
+  private absorbHave(peerId: string, message: MediaHaveMessage): void {
+    let manifest = this.manifests.get(message.media_id);
+    if (message.manifest !== undefined && message.manifest.media_id === message.media_id) {
+      manifest = message.manifest;
+      this.registerManifest(manifest);
+    }
+    if (manifest === undefined) {
+      this.onError?.('media manifest is not known yet', message.media_id);
+      return;
+    }
+
+    let peers = this.peerAvailability.get(message.media_id);
+    if (peers === undefined) {
+      peers = new Map<string, Set<number>>();
+      this.peerAvailability.set(message.media_id, peers);
+    }
+    const valid = message.available_chunks.filter(
+      (index) => index >= 0 && index < manifest.total_chunks,
+    );
+    peers.set(peerId, new Set(valid));
+    void this.requestMissing(manifest);
+  }
+
+  private async absorbChunk(peerId: string, message: MediaChunkMessage): Promise<void> {
+    const manifest = this.manifests.get(message.media_id);
+    if (manifest === undefined) {
+      this.onError?.('received a chunk for an unknown manifest', message.media_id);
+      return;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = decodeBase64(message.data_b64);
+    } catch {
+      this.onError?.(`malformed chunk ${message.chunk_index} from ${shortPeer(peerId)}`, message.media_id);
+      return;
+    }
+    const stored = await verifyAndStoreChunk(
+      manifest,
+      message.chunk_index,
+      bytes,
+      this.cache,
+    );
+    if (!stored) {
+      this.onError?.(
+        `chunk ${message.chunk_index} failed SHA-256 verification`,
+        message.media_id,
+      );
+      return;
+    }
+
+    const pending = this.inflight.get(manifest.media_id);
+    pending?.delete(message.chunk_index);
+    if (pending !== undefined && pending.size === 0) this.inflight.delete(manifest.media_id);
+
+    const available = await availableChunks(manifest, this.cache);
+    this.emitProgress(manifest, available);
+    if (await hasCompleteMedia(manifest, this.cache)) {
+      await this.finish(manifest);
+      return;
+    }
+    await this.requestMissing(manifest);
+  }
+
+  private async serveRequest(peerId: string, message: MediaReqMessage): Promise<void> {
+    const manifest = this.manifests.get(message.media_id);
+    for (const index of message.chunk_indices.slice(0, MAX_MEDIA_REQUEST_CHUNKS)) {
+      const chunk = await this.cache.get(message.media_id, index);
+      if (chunk === null) continue;
+      if (
+        manifest !== undefined &&
+        (index >= manifest.total_chunks ||
+          chunk.length > manifest.chunk_size ||
+          chunk.length === 0)
+      ) {
+        continue;
+      }
+      const reply: MediaChunkMessage = {
+        v: 1,
+        t: 'MEDIA_CHUNK',
+        media_id: message.media_id,
+        chunk_index: index,
+        data_b64: encodeBase64(chunk),
+      };
+      const sent = await this.transport.send(peerId, encodeWireMessage(reply));
+      if (!sent) return;
+    }
+  }
+
+  private async requestMissing(manifest: MediaManifest): Promise<void> {
+    if (this.completed.has(manifest.media_id) || this.refreshing.has(manifest.media_id)) return;
+    this.refreshing.add(manifest.media_id);
+    try {
+      const available = new Set(await availableChunks(manifest, this.cache));
+      if (available.size === manifest.total_chunks) {
+        await this.finish(manifest);
+        return;
+      }
+      const peers = this.peerAvailability.get(manifest.media_id);
+      if (peers === undefined || peers.size === 0) return;
+
+      let bestPeer: string | null = null;
+      let bestMissing: number[] = [];
+      for (const [peerId, announced] of peers) {
+        if (!this.transport.peerIds().includes(peerId)) continue;
+        const missing = [...announced]
+          .filter((index) => !available.has(index))
+          .sort((a, b) => a - b);
+        if (missing.length > bestMissing.length) {
+          bestPeer = peerId;
+          bestMissing = missing;
+        }
+      }
+      if (bestPeer === null || bestMissing.length === 0) return;
+
+      const pending = this.inflight.get(manifest.media_id) ?? new Map<number, MediaInflight>();
+      const now = this.now();
+      const batch: number[] = [];
+      for (const index of bestMissing) {
+        const record = pending.get(index);
+        if (record !== undefined && now - record.at < this.requestTimeoutMs) continue;
+        batch.push(index);
+        pending.set(index, { peerId: bestPeer, at: now, attempts: (record?.attempts ?? 0) + 1 });
+        if (batch.length >= this.requestWindow) break;
+      }
+      if (batch.length === 0) return;
+      this.inflight.set(manifest.media_id, pending);
+
+      const request: MediaReqMessage = {
+        v: 1,
+        t: 'MEDIA_REQ',
+        media_id: manifest.media_id,
+        chunk_indices: batch,
+      };
+      const sent = await this.transport.send(bestPeer, encodeWireMessage(request));
+      if (!sent) {
+        for (const index of batch) pending.delete(index);
+        if (pending.size === 0) this.inflight.delete(manifest.media_id);
+      }
+    } finally {
+      this.refreshing.delete(manifest.media_id);
+    }
+  }
+
+  private async finish(manifest: MediaManifest): Promise<void> {
+    if (this.completed.has(manifest.media_id)) return;
+    const blob = await assembleVideoBlob(manifest, this.cache);
+    if (blob === null) return;
+    this.completed.add(manifest.media_id);
+    const available = await availableChunks(manifest, this.cache);
+    this.emitProgress(manifest, available);
+    this.onComplete?.(manifest, blob);
+  }
+
+  private async sendHave(peerId: string, manifest: MediaManifest): Promise<void> {
+    const available = await availableChunks(manifest, this.cache);
+    const message: MediaHaveMessage = {
+      v: 1,
+      t: 'MEDIA_HAVE',
+      media_id: manifest.media_id,
+      available_chunks: available,
+      manifest: wireManifest(manifest),
+    };
+    await this.transport.send(peerId, encodeWireMessage(message));
+  }
+
+  private emitProgress(manifest: MediaManifest, available: readonly number[]): void {
+    this.onProgress?.(manifest, available, manifest.total_chunks);
+  }
+
+  private tick(): void {
+    const now = this.now();
+    for (const [mediaId, pending] of [...this.inflight]) {
+      for (const [index, record] of [...pending]) {
+        if (now - record.at >= this.requestTimeoutMs) pending.delete(index);
+      }
+      if (pending.size === 0) this.inflight.delete(mediaId);
+    }
+    for (const manifest of this.manifests.values()) {
+      if (!this.completed.has(manifest.media_id)) void this.requestMissing(manifest);
+    }
+  }
+}
+
+function shortPeer(peerId: string): string {
+  return peerId.length > 18 ? `${peerId.slice(0, 10)}…${peerId.slice(-5)}` : peerId;
+}
+
+/**
+ * Inline bytes are a carrier payload, not wire data. Peers fetch and verify
+ * chunks instead, so announcements stay small even for a 1.5 MB clip.
+ */
+function wireManifest(manifest: MediaManifest): MediaManifest {
+  if (manifest.inline_data_b64 === undefined) return manifest;
+  const { inline_data_b64: _inline, ...rest } = manifest;
+  return rest;
 }

@@ -12,14 +12,22 @@ import {
 import {
   sealPacket,
   verifyPacket,
+  type MediaManifest,
   type PacketVerificationResult,
   type SporePacket,
 } from './crypto/packet';
 import type { MiningProgress } from './crypto/pow';
+import {
+  assembleVideoBlob,
+  availableChunks,
+  importInlineMedia,
+  ingestVideoFile,
+  type VideoSlice,
+} from './media/videoSwarm';
 import { DandelionRouter, type PublishRoute } from './net/dandelion';
 import { GossipEngine } from './net/gossip';
-import { parseWireMessage, type WireMessage } from './net/protocol';
-import { Swarm, parseTopicChannels } from './net/swarm';
+import { isMediaMessage, parseWireMessage, type WireMessage } from './net/protocol';
+import { MediaSwarm, Swarm, parseTopicChannels } from './net/swarm';
 import { Telemetry, type TelemetryEvent, type TelemetryEventName } from './net/telemetry';
 import { transportLabel } from './net/transport';
 import { exportSporeQuine } from './quine/compiler';
@@ -108,6 +116,97 @@ const LOG_TONES: Record<TelemetryEventName, LogTone> = {
   'sync:complete': 'sync',
 };
 
+interface GuideStep {
+  readonly kicker: string;
+  readonly title: string;
+  readonly body: readonly string[];
+  readonly target?: string;
+}
+
+const GUIDE_STEPS: readonly GuideStep[] = [
+  {
+    kicker: 'STEP 1 · THE BASICS',
+    title: 'One file. No origin server.',
+    body: [
+      'SPORE is a publishing client that lives entirely in this HTML document. It boots offline, makes zero network requests until you ask, and can be copied by email, USB, or any messenger.',
+      'Everything you publish is signed locally with a secp256k1 key and sealed with Hashcash proof of work. Readers verify the signatures and hashes themselves.',
+    ],
+    target: '.brand-block',
+  },
+  {
+    kicker: 'STEP 2 · IDENTITY',
+    title: 'Your key is ephemeral until you back it up.',
+    body: [
+      'The fingerprint below is derived from a fresh key generated in this tab. It is not saved across reloads.',
+      'Open key vault, enter a passphrase, and press encrypt key to create an encrypted backup. To restore, press restore…, paste the JSON, and press decrypt & adopt key. The private key is never displayed raw.',
+    ],
+    target: '#fingerprint',
+  },
+  {
+    kicker: 'STEP 3 · DISCOVERY',
+    title: 'Join only when you want the live mesh.',
+    body: [
+      'Type a channel or topic, then press join. SPORE uses BitTorrent WebSocket trackers and Nostr relays for signaling, and WebRTC DataChannels for peer traffic.',
+      'If public signaling is blocked, open the WebRTC peer bridge and exchange a spore-peer:// invite over any messenger. Press leave to stop signaling; direct peers stay connected.',
+    ],
+    target: '.channel-switcher',
+  },
+  {
+    kicker: 'STEP 4 · PUBLISH',
+    title: 'Write, choose work, seal.',
+    body: [
+      'Write in the composer, pick 8–20 proof-of-work bits, and press mine & seal post. The packet is mined, signed, verified, stored, and routed through the Dandelion++ stem.',
+      'Keep Dandelion++ Stem Routing checked for source obfuscation, or uncheck it to broadcast directly. Mining can be cancelled without freezing the tab.',
+    ],
+    target: '#content',
+  },
+  {
+    kicker: 'STEP 5 · VIDEO',
+    title: 'Attach a Reel and seed it as a swarm.',
+    body: [
+      'Press Import Reel Video. SPORE slices the file into 64 KiB chunks, hashes each chunk and the complete binary with SHA-256, and stores them in IndexedDB plus an in-memory fallback.',
+      'Small clips up to 1.5 MB embed inline, so a stego PNG or Quine can play them with zero peers online. Larger clips are fetched from peers in 4–6 chunk windows and verified before assembly.',
+    ],
+    target: '#import-video',
+  },
+  {
+    kicker: 'STEP 6 · THE FEED',
+    title: 'Watch packets and video arrive.',
+    body: [
+      'The Field Feed admits verified packets by trust, work, and recency. Media posts show a player once every chunk is local and hash-verified.',
+      'Unknown authors need a 16-bit work floor. Trust is local: follow, vouch, or mute an author, and choose All Verified, 2-Hop Trusted Only, or High PoW Only.',
+    ],
+    target: '.feed-panel',
+  },
+  {
+    kicker: 'STEP 7 · OFFLINE CARRIERS',
+    title: 'Carry the feed across a blackout.',
+    body: [
+      'Export a self-replicating Quine to embed the app plus up to 200 verified packets in one HTML file. Press Pack into Stego PNG on any post to render a lossless RGB LSB carrier.',
+      'Both formats work from file:// with no server. They are public, not encrypted: anyone who has the file can read it.',
+    ],
+    target: '#export-quine',
+  },
+  {
+    kicker: 'STEP 8 · COMMAND CONSOLE',
+    title: 'One input for the common actions.',
+    body: [
+      'The console accepts /help, /join, /leave, /post, /seal, /video, /import, /export, /filter, /receipt, /vault, /bridge, /diagnostics, /status, and /guide.',
+      'Use the arrow keys to recall commands. Every original button remains available; the diagnostics toggle hides the protocol trace without deleting it from the DOM.',
+    ],
+    target: '#command-input',
+  },
+  {
+    kicker: 'STEP 9 · READY',
+    title: 'Publish, mirror, repeat.',
+    body: [
+      'SPORE is a prototype, not an audited security product. Packets are public, Dandelion++-style routing is source obfuscation rather than anonymity, and direct WebRTC peers may learn your IP address.',
+      'Back up your key, verify packets rather than screenshots, and keep an offline copy of the HTML you trust.',
+    ],
+    target: '.site-footer',
+  },
+];
+
 const numberFormat = new Intl.NumberFormat('en-US');
 
 function byId<T extends HTMLElement>(id: string): T {
@@ -132,6 +231,13 @@ function setStatus(node: HTMLElement, text: string, tone: Tone = 'idle'): void {
 
 function formatCount(value: number): string {
   return numberFormat.format(Math.round(value));
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
 }
 
 function makeElement<K extends keyof HTMLElementTagNameMap>(
@@ -316,6 +422,33 @@ function boot(): void {
   const manualCopyButton = byId<HTMLButtonElement>('manual-copy');
   const manualStatus = byId<HTMLElement>('manual-status');
 
+  const appShell = byId<HTMLElement>('app');
+  const commandForm = byId<HTMLFormElement>('command-form');
+  const commandInput = byId<HTMLInputElement>('command-input');
+  const commandStatus = byId<HTMLElement>('command-status');
+  const openGuideButton = byId<HTMLButtonElement>('open-guide');
+  const toggleAdvancedButton = byId<HTMLButtonElement>('toggle-advanced');
+
+  const videoFileInput = byId<HTMLInputElement>('video-file');
+  const importVideoButton = byId<HTMLButtonElement>('import-video');
+  const clearVideoButton = byId<HTMLButtonElement>('clear-video');
+  const videoAttachTag = byId<HTMLElement>('video-attach-tag');
+  const videoHint = byId<HTMLElement>('video-hint');
+  const videoStatus = byId<HTMLElement>('video-status');
+  const videoPreview = byId<HTMLVideoElement>('video-preview');
+
+  const guideModal = byId<HTMLDialogElement>('guide-modal');
+  const closeGuideButton = byId<HTMLButtonElement>('close-guide');
+  const guideTitle = byId<HTMLElement>('guide-title');
+  const guideKicker = byId<HTMLElement>('guide-kicker');
+  const guideBody = byId<HTMLElement>('guide-body');
+  const guideStepCount = byId<HTMLElement>('guide-step-count');
+  const guideProgressBar = byId<HTMLElement>('guide-progress-bar');
+  const guidePrevButton = byId<HTMLButtonElement>('guide-prev');
+  const guideNextButton = byId<HTMLButtonElement>('guide-next');
+  const guideDoneButton = byId<HTMLButtonElement>('guide-done');
+  const guideStatus = byId<HTMLElement>('guide-status');
+
   const telemetryCount = byId<HTMLElement>('telemetry-count');
   const telemetryList = byId<HTMLElement>('telemetry-list');
   const telemetryClearButton = byId<HTMLButtonElement>('telemetry-clear');
@@ -339,6 +472,15 @@ function boot(): void {
   let composerMode: ComposerMode = 'post';
   let receiptBytes: Uint8Array | null = null;
   let receiptDigest = '';
+  let pendingVideo: VideoSlice | null = null;
+  let pendingVideoUrl: string | null = null;
+  let guideStep = 0;
+  let guideTarget: HTMLElement | null = null;
+  let commandCursor = -1;
+  const commandHistory: string[] = [];
+  const mediaBlobUrls = new Map<string, string>();
+  const mediaAssembling = new Set<string>();
+  const mediaRequested = new Set<string>();
 
   const store = new SporeStore({
     trustScore: (pubkey) => trustGraph.score(pubkey),
@@ -348,6 +490,34 @@ function boot(): void {
   const telemetry = new Telemetry({ maxHistory: LOG_LIMIT });
   const swarm = new Swarm();
   const logEntries: LogEntry[] = [];
+
+  const mediaSwarm = new MediaSwarm({
+    transport: swarm,
+    onProgress: (manifest, available) => {
+      updateMediaSlots(manifest, available);
+    },
+    onComplete: (manifest, blob) => {
+      applyMediaBlob(manifest, blob);
+      void mediaSwarm.announce(manifest);
+      appendLog(
+        'media:complete',
+        'VERIFIED',
+        `media=${manifest.media_id.slice(0, 16)}… · chunks=${manifest.total_chunks} · ` +
+          `bytes=${manifest.size} · assembly=sha256-ok`,
+        'verified',
+      );
+    },
+    onError: (message, mediaId) => {
+      appendLog(
+        'media:drop',
+        'DROP',
+        `${mediaId !== undefined ? `media=${mediaId.slice(0, 16)}… · ` : ''}${message}`,
+        'drop',
+      );
+      if (mediaId !== undefined) updateMediaError(mediaId, message);
+      setStatus(feedStatus, `media · ${message}`, 'error');
+    },
+  });
 
   /* ------------------------------------------------------------------ shell */
 
@@ -450,6 +620,173 @@ function boot(): void {
 
   function shortPeerId(peerId: string): string {
     return peerId.length > 18 ? `${peerId.slice(0, 10)}…${peerId.slice(-5)}` : peerId;
+  }
+
+  /* ------------------------------------------------------------------ media */
+
+  function mediaCards(mediaId: string): HTMLElement[] {
+    return [...document.querySelectorAll<HTMLElement>(`.feed-media[data-media-id="${mediaId}"]`)];
+  }
+
+  function mediaTone(status: HTMLElement, text: string, tone: Tone): void {
+    status.textContent = text;
+    if (tone === 'idle') delete status.dataset['tone'];
+    else status.dataset['tone'] = tone;
+  }
+
+  function applyMediaBlob(manifest: MediaManifest, blob: Blob): void {
+    if (typeof URL.createObjectURL !== 'function') return;
+    const previous = mediaBlobUrls.get(manifest.media_id);
+    if (previous !== undefined) URL.revokeObjectURL(previous);
+    const url = URL.createObjectURL(blob);
+    mediaBlobUrls.set(manifest.media_id, url);
+    for (const card of mediaCards(manifest.media_id)) {
+      card.dataset['ready'] = 'true';
+      const video = card.querySelector('video');
+      if (video !== null) {
+        video.src = url;
+        video.hidden = false;
+      }
+      const status = card.querySelector<HTMLElement>('.media-status');
+      if (status !== null) {
+        mediaTone(
+          status,
+          `${manifest.total_chunks}/${manifest.total_chunks} chunks · sha256 verified · ${formatBytes(
+            manifest.size,
+          )}`,
+          'ok',
+        );
+      }
+      const bar = card.querySelector<HTMLElement>('.media-progress > span');
+      if (bar !== null) bar.style.width = '100%';
+    }
+  }
+
+  function updateMediaSlots(manifest: MediaManifest, available: readonly number[]): void {
+    const have = available.length;
+    const total = manifest.total_chunks;
+    const percent = total === 0 ? 0 : Math.min(100, (have / total) * 100);
+    const readyUrl = mediaBlobUrls.get(manifest.media_id);
+    for (const card of mediaCards(manifest.media_id)) {
+      card.dataset['chunks'] = String(have);
+      const bar = card.querySelector<HTMLElement>('.media-progress > span');
+      if (bar !== null) bar.style.width = `${percent.toFixed(1)}%`;
+      const status = card.querySelector<HTMLElement>('.media-status');
+      if (readyUrl !== undefined) {
+        if (status !== null) {
+          mediaTone(
+            status,
+            `${total}/${total} chunks · sha256 verified · playing locally`,
+            'ok',
+          );
+        }
+        continue;
+      }
+      if (status !== null) {
+        const tone: Tone = have === total ? 'ok' : swarm.peerIds().length > 0 ? 'busy' : 'idle';
+        mediaTone(
+          status,
+          have === total
+            ? `${total}/${total} chunks · assembling verified blob…`
+            : `${have}/${total} chunks · ${formatBytes(manifest.size)} · ` +
+                (swarm.peerIds().length > 0 ? 'fetching from swarm' : 'waiting for peers or inline carrier'),
+          tone,
+        );
+      }
+    }
+    if (have === total) void ensureMediaPlayback(manifest);
+  }
+
+  function updateMediaError(mediaId: string, message: string): void {
+    for (const card of mediaCards(mediaId)) {
+      const status = card.querySelector<HTMLElement>('.media-status');
+      if (status !== null) mediaTone(status, message, 'error');
+    }
+  }
+
+  async function ensureMediaPlayback(manifest: MediaManifest): Promise<void> {
+    if (mediaBlobUrls.has(manifest.media_id) || mediaAssembling.has(manifest.media_id)) return;
+    mediaAssembling.add(manifest.media_id);
+    try {
+      const blob = await assembleVideoBlob(manifest);
+      if (blob !== null) {
+        applyMediaBlob(manifest, blob);
+        appendLog(
+          'media:play',
+          'VERIFIED',
+          `media=${manifest.media_id.slice(0, 16)}… · bytes=${blob.size} · ` +
+            `chunks=${manifest.total_chunks} · hash=ok`,
+          'verified',
+        );
+      }
+    } finally {
+      mediaAssembling.delete(manifest.media_id);
+    }
+  }
+
+  async function refreshMediaCard(manifest: MediaManifest): Promise<void> {
+    mediaSwarm.registerManifest(manifest);
+    let available = await availableChunks(manifest);
+    updateMediaSlots(manifest, available);
+    if (available.length === manifest.total_chunks) {
+      await ensureMediaPlayback(manifest);
+      return;
+    }
+    if (manifest.inline_data_b64 !== undefined) {
+      const imported = await importInlineMedia(manifest);
+      available = await availableChunks(manifest);
+      updateMediaSlots(manifest, available);
+      if (imported) void mediaSwarm.announce(manifest);
+      if (available.length === manifest.total_chunks) {
+        await ensureMediaPlayback(manifest);
+        return;
+      }
+    }
+    if (swarm.peerIds().length > 0 && !mediaRequested.has(manifest.media_id)) {
+      mediaRequested.add(manifest.media_id);
+      mediaSwarm.request(manifest);
+    }
+  }
+
+  function appendVideoCard(item: HTMLElement, manifest: MediaManifest): void {
+    const card = makeElement('div', 'feed-media');
+    card.dataset['mediaId'] = manifest.media_id;
+    card.dataset['ready'] = 'false';
+    card.dataset['chunks'] = '0';
+
+    const meta = makeElement('div', 'media-meta');
+    meta.append(
+      makeElement('strong', undefined, `${formatBytes(manifest.size)} · ${manifest.total_chunks} chunks`),
+    );
+    meta.append(makeElement('span', undefined, manifest.mime));
+    card.append(meta);
+
+    const video = document.createElement('video');
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+    video.hidden = true;
+    video.setAttribute('playsinline', '');
+    video.setAttribute('aria-label', `Video attachment ${manifest.file_name}`);
+    card.append(video);
+
+    const progress = makeElement('div', 'media-progress');
+    progress.append(makeElement('span'));
+    card.append(progress);
+
+    const status = makeElement('p', 'media-status', 'checking local chunk cache…');
+    card.append(status);
+
+    item.append(card);
+    void refreshMediaCard(manifest);
+  }
+
+  function registerStoredMedia(): void {
+    for (const packet of store.packetsSnapshot()) {
+      if (packet.media_manifest !== undefined) {
+        mediaSwarm.registerManifest(packet.media_manifest);
+      }
+    }
   }
 
   /* ------------------------------------------------------------------- feed */
@@ -629,6 +966,7 @@ function boot(): void {
       );
 
       if (packet.kind === 'receipt') appendReceiptCard(item, packet);
+      if (packet.media_manifest !== undefined) appendVideoCard(item, packet.media_manifest);
 
       const foot = makeElement('div', 'feed-foot');
       const idLabel = makeElement('code', 'feed-id', `id ${packet.id.slice(0, 16)}…`);
@@ -802,6 +1140,7 @@ function boot(): void {
     switch (event.type) {
       case 'status':
         renderMesh();
+        if (event.status === 'joined') registerStoredMedia();
         setStatus(
           meshNote,
           event.status === 'joined'
@@ -819,6 +1158,7 @@ function boot(): void {
           rooms: event.peer.rooms.join(','),
         });
         gossip.onPeerJoin(event.peer.id);
+        mediaSwarm.onPeerJoin(event.peer.id);
         renderMesh();
         setStatus(
           meshNote,
@@ -834,6 +1174,7 @@ function boot(): void {
           transports: event.transports.join(','),
         });
         gossip.onPeerLeave(event.peerId);
+        mediaSwarm.onPeerLeave(event.peerId);
         renderMesh();
         setStatus(meshNote, `peer left · ${shortPeerId(event.peerId)}`, 'idle');
         break;
@@ -866,6 +1207,10 @@ function boot(): void {
         reason: 'malformed-wire',
         detail: parsed.reason,
       });
+      return;
+    }
+    if (isMediaMessage(parsed.message)) {
+      mediaSwarm.handleMessage(peerId, parsed.message);
       return;
     }
     const handledBySync = gossip.handleMessage(peerId, parsed.message);
@@ -969,6 +1314,79 @@ function boot(): void {
     postFields.hidden = mode === 'receipt';
     receiptFields.hidden = mode === 'post';
     sealButton.textContent = mode === 'receipt' ? 'mine & seal receipt' : 'mine & seal post';
+  }
+
+  const VIDEO_HINT =
+    'MP4 or WebM. Sliced into 64 KiB chunks, verified with SHA-256, and seeded to peers. ' +
+    'Clips up to 1.5 MB also embed inline for zero-peer offline playback.';
+
+  function clearPendingVideo(): void {
+    if (pendingVideoUrl !== null && typeof URL.revokeObjectURL === 'function') {
+      URL.revokeObjectURL(pendingVideoUrl);
+    }
+    pendingVideo = null;
+    pendingVideoUrl = null;
+    videoPreview.removeAttribute('src');
+    videoPreview.hidden = true;
+    videoAttachTag.textContent = 'none';
+    videoHint.textContent = VIDEO_HINT;
+    clearVideoButton.hidden = true;
+    videoFileInput.value = '';
+    setStatus(videoStatus, '', 'idle');
+  }
+
+  function renderPendingVideo(slice: VideoSlice, sourceLabel: string): void {
+    const { manifest } = slice;
+    videoAttachTag.textContent = `${manifest.total_chunks} chunks`;
+    videoHint.textContent =
+      `${sourceLabel} · ${formatBytes(manifest.size)} · ${manifest.mime}` +
+      (manifest.inline_data_b64 !== undefined ? ' · inline carrier available' : '') +
+      ` · sha256 ${manifest.media_id.slice(0, 16)}…`;
+    clearVideoButton.hidden = false;
+  }
+
+  async function handleVideoFile(): Promise<void> {
+    const file = videoFileInput.files?.[0];
+    if (file === undefined) return;
+    setStatus(videoStatus, `slicing ${file.name} into 64 KiB chunks…`, 'busy');
+    try {
+      const slice = await ingestVideoFile(file);
+      if (pendingVideoUrl !== null && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(pendingVideoUrl);
+      }
+      pendingVideo = slice;
+      pendingVideoUrl =
+        typeof URL.createObjectURL === 'function' ? URL.createObjectURL(file) : null;
+      if (pendingVideoUrl !== null) {
+        videoPreview.src = pendingVideoUrl;
+        videoPreview.hidden = false;
+      }
+      renderPendingVideo(slice, file.name);
+      mediaSwarm.registerManifest(slice.manifest);
+      await mediaSwarm.announce(slice.manifest);
+      setStatus(
+        videoStatus,
+        `${slice.manifest.total_chunks} chunks verified and cached · ` +
+          `${formatBytes(slice.manifest.size)} · ` +
+          (swarm.peerIds().length > 0
+            ? `announced to ${swarm.peerIds().length} peer${swarm.peerIds().length === 1 ? '' : 's'}`
+            : 'will seed when peers connect'),
+        'ok',
+      );
+      appendLog(
+        'media:ingest',
+        'VERIFIED',
+        `file=${file.name} · bytes=${slice.manifest.size} · chunks=${slice.manifest.total_chunks} · ` +
+          `sha256=${slice.manifest.media_id.slice(0, 16)}… · inline=${
+            slice.manifest.inline_data_b64 !== undefined ? 'yes' : 'no'
+          }`,
+        'verified',
+      );
+    } catch (error) {
+      setStatus(videoStatus, `video import failed: ${errorMessage(error)}`, 'error');
+    } finally {
+      videoFileInput.value = '';
+    }
   }
 
   function updateReceiptDigest(): void {
@@ -1126,18 +1544,25 @@ function boot(): void {
   }
 
   async function handlePostSeal(): Promise<void> {
-    const content = contentEl.value;
-    if (content.trim().length === 0) {
+    const rawContent = contentEl.value;
+    if (rawContent.trim().length === 0 && pendingVideo === null) {
       setStatus(mineStatus, 'write something first', 'error');
       contentEl.focus();
       return;
     }
+    const content =
+      rawContent.trim().length > 0 ? rawContent : (pendingVideo?.manifest.file_name ?? '');
+    const video = pendingVideo;
     const bits = Number(powSlider.value);
     const controller = beginMining(bits);
     const startedAt = performance.now();
     try {
       const packet = await sealPacket(
-        { kind: 'post', content },
+        {
+          kind: 'post',
+          content,
+          ...(video !== null ? { media_manifest: video.manifest } : {}),
+        },
         identity,
         {
           powBits: bits,
@@ -1154,6 +1579,15 @@ function boot(): void {
         return;
       }
       await publishSealed(packet, verification, elapsedMs, 'post');
+      if (video !== null) {
+        mediaSwarm.registerManifest(video.manifest);
+        await mediaSwarm.announce(video.manifest);
+        setStatus(
+          videoStatus,
+          `published with ${video.manifest.total_chunks} verified chunks · seeding to peers`,
+          'ok',
+        );
+      }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         setStatus(mineStatus, 'mining cancelled', 'idle');
@@ -1288,6 +1722,9 @@ function boot(): void {
         return;
       }
       const report = store.merge(result.packets);
+      for (const packet of result.packets) {
+        if (packet.media_manifest !== undefined) mediaSwarm.registerManifest(packet.media_manifest);
+      }
       rebuildTrust();
       renderFeed();
       renderStoreStatus();
@@ -1518,6 +1955,224 @@ function boot(): void {
     }
   }
 
+  /* ------------------------------------------------------------ command bar */
+
+  function rememberCommand(command: string): void {
+    if (command.length === 0) return;
+    if (commandHistory[commandHistory.length - 1] !== command) {
+      commandHistory.push(command);
+      if (commandHistory.length > 40) commandHistory.shift();
+    }
+    commandCursor = -1;
+  }
+
+  const COMMAND_HELP =
+    '/join [topics] · /leave · /post <text> · /seal · /video · /import · /export · ' +
+    '/filter all|2hop|pow · /receipt <url> · /vault · /bridge · /status · /diagnostics · /guide';
+
+  function runCommand(raw: string): void {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) return;
+    rememberCommand(trimmed);
+    const space = trimmed.indexOf(' ');
+    const head = (space === -1 ? trimmed : trimmed.slice(0, space)).toLowerCase();
+    const arg = space === -1 ? '' : trimmed.slice(space + 1).trim();
+
+    switch (head) {
+      case '/help': {
+        setStatus(commandStatus, COMMAND_HELP, 'idle');
+        return;
+      }
+      case '/guide':
+      case '/tour': {
+        openGuide(0);
+        setStatus(commandStatus, 'guided tour opened', 'ok');
+        return;
+      }
+      case '/join': {
+        if (arg.length > 0) topicsInput.value = arg;
+        meshConnectButton.click();
+        setStatus(
+          commandStatus,
+          `join requested · ${topicsInput.value.trim() || 'global'}`,
+          'busy',
+        );
+        return;
+      }
+      case '/leave': {
+        meshDisconnectButton.click();
+        setStatus(commandStatus, 'signaling leave requested', 'idle');
+        return;
+      }
+      case '/post': {
+        setComposerMode('post');
+        if (arg.length === 0) {
+          contentEl.focus();
+          setStatus(commandStatus, 'write a packet, then press /seal', 'idle');
+          return;
+        }
+        contentEl.value = arg;
+        contentEl.focus();
+        setStatus(commandStatus, 'draft loaded · press /seal or mine & seal post', 'ok');
+        return;
+      }
+      case '/seal': {
+        handleSeal();
+        setStatus(commandStatus, 'seal requested', 'busy');
+        return;
+      }
+      case '/video': {
+        videoFileInput.click();
+        setStatus(commandStatus, 'choose a video file to slice and seed', 'busy');
+        return;
+      }
+      case '/import': {
+        stegoFileInput.click();
+        setStatus(commandStatus, 'choose a SPORE PNG carrier', 'busy');
+        return;
+      }
+      case '/export': {
+        handleExportQuine();
+        setStatus(commandStatus, 'quine export requested', 'ok');
+        return;
+      }
+      case '/receipt': {
+        setComposerMode('receipt');
+        if (arg.length > 0) receiptUrlInput.value = arg;
+        receiptUrlInput.focus();
+        setStatus(
+          commandStatus,
+          arg.length > 0
+            ? 'receipt URL loaded · add source text or media, then /seal'
+            : 'paste an Instagram, YouTube, or X/Twitter URL',
+          'idle',
+        );
+        return;
+      }
+      case '/filter': {
+        const filter = arg.toLowerCase();
+        if (filter === 'all' || filter === '2hop' || filter === 'pow') {
+          setFeedFilter(filter);
+          setStatus(commandStatus, `feed filter · ${filter}`, 'ok');
+        } else {
+          setStatus(commandStatus, 'usage: /filter all|2hop|pow', 'error');
+        }
+        return;
+      }
+      case '/vault': {
+        openDialog(identityModal);
+        setStatus(commandStatus, 'key vault opened', 'ok');
+        return;
+      }
+      case '/bridge': {
+        openDialog(manualBox);
+        setStatus(commandStatus, 'manual SDP bridge opened', 'ok');
+        return;
+      }
+      case '/status': {
+        const mediaCount = store
+          .packetsSnapshot()
+          .filter((packet) => packet.media_manifest !== undefined).length;
+        setStatus(
+          commandStatus,
+          `${store.size} packets · ${BACKEND_LABELS[store.status.backend]} · ` +
+            `${swarm.peersInfo().length} peers · ${swarm.isJoined ? 'signaling on' : 'offline'} · ` +
+            `${mediaCount} media manifest${mediaCount === 1 ? '' : 's'}`,
+          'ok',
+        );
+        return;
+      }
+      case '/diagnostics': {
+        const hidden = !appShell.classList.contains('diagnostics-hidden');
+        setDiagnosticsHidden(hidden);
+        setStatus(
+          commandStatus,
+          hidden ? 'diagnostics hidden · DOM preserved' : 'diagnostics visible',
+          'ok',
+        );
+        return;
+      }
+      case '/trace': {
+        setDiagnosticsHidden(false);
+        telemetryList.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        setStatus(commandStatus, 'protocol trace visible', 'ok');
+        return;
+      }
+      case '/clear': {
+        telemetry.clear();
+        logEntries.length = 0;
+        renderLog();
+        setStatus(commandStatus, 'protocol trace cleared', 'idle');
+        return;
+      }
+      default: {
+        setStatus(
+          commandStatus,
+          `unknown command ${head} · type /help`,
+          'error',
+        );
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ tour */
+
+  function clearGuideTarget(): void {
+    if (guideTarget !== null) {
+      guideTarget.classList.remove('guide-focus');
+      guideTarget = null;
+    }
+  }
+
+  function renderGuide(): void {
+    const step = GUIDE_STEPS[guideStep];
+    if (step === undefined) return;
+    clearGuideTarget();
+    guideTitle.textContent = step.title;
+    guideKicker.textContent = step.kicker;
+    guideBody.replaceChildren(
+      ...step.body.map((paragraph) => makeElement('p', undefined, paragraph)),
+    );
+    guideStepCount.textContent = `${guideStep + 1} / ${GUIDE_STEPS.length}`;
+    guideProgressBar.style.width = `${((guideStep + 1) / GUIDE_STEPS.length) * 100}%`;
+    guidePrevButton.disabled = guideStep === 0;
+    const last = guideStep === GUIDE_STEPS.length - 1;
+    guideNextButton.textContent = last ? 'finish' : 'next';
+    guideDoneButton.hidden = !last;
+    setStatus(
+      guideStatus,
+      last ? 'tour complete · every control remains available' : 'use next / back or the arrow keys',
+      'idle',
+    );
+    if (step.target !== undefined) {
+      const target = document.querySelector<HTMLElement>(step.target);
+      if (target !== null) {
+        guideTarget = target;
+        target.classList.add('guide-focus');
+        if (typeof target.scrollIntoView === 'function') {
+          target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+      }
+    }
+  }
+
+  function openGuide(index = 0): void {
+    guideStep = Math.min(Math.max(0, index), GUIDE_STEPS.length - 1);
+    renderGuide();
+    openDialog(guideModal);
+  }
+
+  function closeGuide(): void {
+    clearGuideTarget();
+    closeDialog(guideModal);
+  }
+
+  function setDiagnosticsHidden(hidden: boolean): void {
+    appShell.classList.toggle('diagnostics-hidden', hidden);
+    toggleAdvancedButton.textContent = hidden ? 'show diagnostics' : 'hide diagnostics';
+    toggleAdvancedButton.setAttribute('aria-pressed', String(!hidden));
+  }
+
   /* -------------------------------------------------------------- listeners */
 
   modePostButton.addEventListener('click', () => setComposerMode('post'));
@@ -1526,6 +2181,83 @@ function boot(): void {
   filterAll.addEventListener('click', () => setFeedFilter('all'));
   filter2Hop.addEventListener('click', () => setFeedFilter('2hop'));
   filterPow.addEventListener('click', () => setFeedFilter('pow'));
+
+  importVideoButton.addEventListener('click', () => videoFileInput.click());
+  videoFileInput.addEventListener('change', () => {
+    void handleVideoFile();
+  });
+  clearVideoButton.addEventListener('click', clearPendingVideo);
+
+  commandForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const command = commandInput.value;
+    commandInput.value = '';
+    runCommand(command);
+  });
+
+  commandInput.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowUp') {
+      if (commandHistory.length === 0) return;
+      event.preventDefault();
+      commandCursor =
+        commandCursor < 0 ? commandHistory.length - 1 : Math.max(0, commandCursor - 1);
+      commandInput.value = commandHistory[commandCursor] ?? '';
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      if (commandHistory.length === 0) return;
+      event.preventDefault();
+      commandCursor =
+        commandCursor < 0 ? -1 : Math.min(commandHistory.length - 1, commandCursor + 1);
+      commandInput.value = commandCursor < 0 ? '' : (commandHistory[commandCursor] ?? '');
+      return;
+    }
+    if (event.key === 'Escape') {
+      commandInput.value = '';
+      commandCursor = -1;
+    }
+  });
+
+  toggleAdvancedButton.addEventListener('click', () => {
+    setDiagnosticsHidden(!appShell.classList.contains('diagnostics-hidden'));
+  });
+
+  openGuideButton.addEventListener('click', () => openGuide(0));
+  closeGuideButton.addEventListener('click', closeGuide);
+  guidePrevButton.addEventListener('click', () => {
+    if (guideStep === 0) return;
+    guideStep -= 1;
+    renderGuide();
+  });
+  guideNextButton.addEventListener('click', () => {
+    if (guideStep >= GUIDE_STEPS.length - 1) {
+      closeGuide();
+      commandInput.focus();
+      return;
+    }
+    guideStep += 1;
+    renderGuide();
+  });
+  guideDoneButton.addEventListener('click', () => {
+    closeGuide();
+    commandInput.focus();
+  });
+  guideModal.addEventListener('close', clearGuideTarget);
+  guideModal.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      if (guideStep < GUIDE_STEPS.length - 1) {
+        guideStep += 1;
+        renderGuide();
+      }
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      if (guideStep > 0) {
+        guideStep -= 1;
+        renderGuide();
+      }
+    }
+  });
 
   vouchPubkeyButton.addEventListener('click', () => handleManualTrust('vouch'));
   mutePubkeyButton.addEventListener('click', () => handleManualTrust('mute'));
@@ -1695,6 +2427,7 @@ function boot(): void {
     setStatus(feedStatus, 'rehydrating storage…', 'busy');
     try {
       const report = await store.load();
+      registerStoredMedia();
       rebuildTrust();
       renderFeed();
       renderStoreStatus(report);

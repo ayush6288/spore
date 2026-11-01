@@ -14,6 +14,7 @@
  */
 
 import { isHex } from '../crypto/encoding';
+import { validateMediaManifest, type MediaManifest } from '../crypto/packet';
 
 export const WIRE_VERSION = 1 as const;
 export const WIRE_ACTION = 'spore-wire-v1';
@@ -24,6 +25,12 @@ export const MAX_SYNC_PACKETS = 24;
 /** A request never exceeds what one response envelope can carry. */
 export const MAX_REQUEST_IDS = MAX_SYNC_PACKETS;
 export const MAX_SYNC_ID_CHARS = 80;
+
+/** Media request windows are deliberately small: 4-6 chunks per round trip. */
+export const MAX_MEDIA_REQUEST_CHUNKS = 6;
+export const MAX_MEDIA_HAVE_CHUNKS = 8_192;
+export const MAX_MEDIA_CHUNK_B64_CHARS = 90_000;
+const BASE64_BODY_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 const SYNC_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 
@@ -61,9 +68,35 @@ export interface FluffPacketMessage {
   readonly packet: unknown;
 }
 
+export interface MediaHaveMessage {
+  readonly v: typeof WIRE_VERSION;
+  readonly t: 'MEDIA_HAVE';
+  readonly media_id: string;
+  readonly available_chunks: readonly number[];
+  /** Present so a peer can verify chunks without a prior packet fetch. */
+  readonly manifest?: MediaManifest;
+}
+
+export interface MediaReqMessage {
+  readonly v: typeof WIRE_VERSION;
+  readonly t: 'MEDIA_REQ';
+  readonly media_id: string;
+  readonly chunk_indices: readonly number[];
+}
+
+export interface MediaChunkMessage {
+  readonly v: typeof WIRE_VERSION;
+  readonly t: 'MEDIA_CHUNK';
+  readonly media_id: string;
+  readonly chunk_index: number;
+  /** Base64 of one chunk (at most 64 KiB raw, ~87 KiB encoded). */
+  readonly data_b64: string;
+}
+
 export type SyncMessage = SyncInvMessage | SyncReqMessage | SyncPktMessage;
 export type PacketMessage = StemPacketMessage | FluffPacketMessage;
-export type WireMessage = SyncMessage | PacketMessage;
+export type MediaMessage = MediaHaveMessage | MediaReqMessage | MediaChunkMessage;
+export type WireMessage = SyncMessage | PacketMessage | MediaMessage;
 export type WireMessageType = WireMessage['t'];
 
 export type WireParseResult =
@@ -100,6 +133,36 @@ function parseIds(value: unknown, limit: number): string[] | null {
     }
   }
   return ids;
+}
+
+function parseChunkIndices(value: unknown, limit: number): number[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > limit) return null;
+  const seen = new Set<number>();
+  const indices: number[] = [];
+  for (const candidate of value) {
+    if (
+      typeof candidate !== 'number' ||
+      !Number.isSafeInteger(candidate) ||
+      candidate < 0 ||
+      candidate >= MAX_MEDIA_HAVE_CHUNKS ||
+      seen.has(candidate)
+    ) {
+      return null;
+    }
+    seen.add(candidate);
+    indices.push(candidate);
+  }
+  indices.sort((a, b) => a - b);
+  return indices;
+}
+
+function parseMediaManifestField(value: unknown, mediaId: string): MediaManifest | null {
+  try {
+    const manifest = validateMediaManifest(value);
+    return manifest.media_id === mediaId ? manifest : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -181,6 +244,98 @@ export function parseWireMessage(raw: unknown): WireParseResult {
     };
   }
 
+  if (type === 'MEDIA_HAVE') {
+    if (!hasOnlyKeys(parsed, ['v', 't', 'media_id', 'available_chunks', 'manifest'])) {
+      return { ok: false, reason: 'MEDIA_HAVE has unknown fields' };
+    }
+    const mediaId = parsed['media_id'];
+    const chunks = parsed['available_chunks'];
+    if (!isPacketId(mediaId)) return { ok: false, reason: 'MEDIA_HAVE media_id is malformed' };
+    if (!Array.isArray(chunks) || chunks.length > MAX_MEDIA_HAVE_CHUNKS) {
+      return { ok: false, reason: 'MEDIA_HAVE available_chunks is malformed' };
+    }
+    const available = new Set<number>();
+    for (const candidate of chunks) {
+      if (
+        typeof candidate !== 'number' ||
+        !Number.isSafeInteger(candidate) ||
+        candidate < 0 ||
+        candidate >= MAX_MEDIA_HAVE_CHUNKS
+      ) {
+        return { ok: false, reason: 'MEDIA_HAVE available_chunks is malformed' };
+      }
+      available.add(candidate);
+    }
+    let manifest: MediaManifest | undefined;
+    if (parsed['manifest'] !== undefined) {
+      const parsedManifest = parseMediaManifestField(parsed['manifest'], mediaId);
+      if (parsedManifest === null) {
+        return { ok: false, reason: 'MEDIA_HAVE manifest is malformed or mismatched' };
+      }
+      manifest = parsedManifest;
+    }
+    return {
+      ok: true,
+      message: {
+        v: WIRE_VERSION,
+        t: 'MEDIA_HAVE',
+        media_id: mediaId,
+        available_chunks: [...available].sort((a, b) => a - b),
+        ...(manifest !== undefined ? { manifest } : {}),
+      },
+    };
+  }
+
+  if (type === 'MEDIA_REQ') {
+    if (!hasOnlyKeys(parsed, ['v', 't', 'media_id', 'chunk_indices'])) {
+      return { ok: false, reason: 'MEDIA_REQ has unknown fields' };
+    }
+    const mediaId = parsed['media_id'];
+    if (!isPacketId(mediaId)) return { ok: false, reason: 'MEDIA_REQ media_id is malformed' };
+    const indices = parseChunkIndices(parsed['chunk_indices'], MAX_MEDIA_REQUEST_CHUNKS);
+    if (indices === null) return { ok: false, reason: 'MEDIA_REQ chunk_indices is malformed' };
+    return {
+      ok: true,
+      message: { v: WIRE_VERSION, t: 'MEDIA_REQ', media_id: mediaId, chunk_indices: indices },
+    };
+  }
+
+  if (type === 'MEDIA_CHUNK') {
+    if (!hasOnlyKeys(parsed, ['v', 't', 'media_id', 'chunk_index', 'data_b64'])) {
+      return { ok: false, reason: 'MEDIA_CHUNK has unknown fields' };
+    }
+    const mediaId = parsed['media_id'];
+    const chunkIndex = parsed['chunk_index'];
+    const data = parsed['data_b64'];
+    if (!isPacketId(mediaId)) return { ok: false, reason: 'MEDIA_CHUNK media_id is malformed' };
+    if (
+      typeof chunkIndex !== 'number' ||
+      !Number.isSafeInteger(chunkIndex) ||
+      chunkIndex < 0 ||
+      chunkIndex >= MAX_MEDIA_HAVE_CHUNKS
+    ) {
+      return { ok: false, reason: 'MEDIA_CHUNK chunk_index is malformed' };
+    }
+    if (
+      typeof data !== 'string' ||
+      data.length === 0 ||
+      data.length > MAX_MEDIA_CHUNK_B64_CHARS ||
+      !BASE64_BODY_RE.test(data)
+    ) {
+      return { ok: false, reason: 'MEDIA_CHUNK data_b64 is malformed' };
+    }
+    return {
+      ok: true,
+      message: {
+        v: WIRE_VERSION,
+        t: 'MEDIA_CHUNK',
+        media_id: mediaId,
+        chunk_index: chunkIndex,
+        data_b64: data,
+      },
+    };
+  }
+
   return { ok: false, reason: `unknown message type: ${type}` };
 }
 
@@ -194,4 +349,8 @@ export function isSyncMessage(message: WireMessage): message is SyncMessage {
 
 export function isPacketMessage(message: WireMessage): message is PacketMessage {
   return message.t === 'PKT_STEM' || message.t === 'PKT_FLUFF';
+}
+
+export function isMediaMessage(message: WireMessage): message is MediaMessage {
+  return message.t === 'MEDIA_HAVE' || message.t === 'MEDIA_REQ' || message.t === 'MEDIA_CHUNK';
 }

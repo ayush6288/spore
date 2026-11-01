@@ -16,7 +16,7 @@
 
 ## What is SPORE?
 
-SPORE is a local-first, peer-to-peer publishing protocol and client that compiles into **one self-contained HTML file**. The current verified build is **273,621 bytes (~274 KB raw)**. There is no account server, database, CDN, or required origin. Authors generate keys locally, sign packets locally, and readers verify them locally. Copies move as ordinary files, PNG carriers, or self-replicating HTML snapshots.
+SPORE is a local-first, peer-to-peer publishing protocol and client that compiles into **one self-contained HTML file**. The current verified build is **313,049 bytes (~313 KB raw)**. There is no account server, database, CDN, or required origin. Authors generate keys locally, sign packets locally, and readers verify them locally. Copies move as ordinary files, PNG carriers, self-replicating HTML snapshots, or P2P video chunks.
 
 The application makes **zero network requests at boot** and works from `file://`. Live peer discovery is optional: it starts only when you press **join**. SPORE then signals over BitTorrent WebSocket trackers and Nostr relays, and carries peer traffic over WebRTC DataChannels (DTLS-encrypted by the browser). If those are blocked, a **Manual Offline SDP Copy-Paste Bridge** can exchange a compressed `spore-peer://…` invite over any messenger.
 
@@ -68,6 +68,16 @@ Public relays and trackers see connection metadata and IP addresses. Direct WebR
 3. The exported document contains the application plus **up to 200 verified packets**, selected by trust, declared work, and recency. It is not necessarily the entire local store.
 4. Send the file over messaging, AirDrop, Nearby Share, Bluetooth, USB, or any file-sharing channel. When opened—even completely offline—it hydrates the same verified feed with no server.
 
+### 5. Share and play a Reel
+
+1. In the **Transmit** composer, press **Import Reel Video** and choose an MP4, WebM, or other browser-playable video.
+2. SPORE slices the file into **64 KiB chunks**, hashes every chunk and the complete binary with SHA-256, and caches the chunks in IndexedDB (`spore_video_chunks`) with an in-memory fallback.
+3. Write an optional caption and press **mine & seal post**. The signed packet carries the media manifest, and the app seeds the chunks to connected peers.
+4. On another peer, the feed card shows `n / total chunks` as verified chunks arrive in 4–6 chunk request windows. The player appears only after every chunk and the assembled blob pass SHA-256 verification.
+5. Clips up to **1.5 MB** are embedded inline in the manifest, so a stego PNG or Quine can play them with **zero peers online**. Larger clips need at least one peer that has the chunks—or a live signaling path—to complete.
+
+The manifest's `media_id` is the SHA-256 of the full file and is bound to the signed packet through `media_cid`. A relay can serve bytes, but it cannot substitute them without failing the chunk or final-blob hash check.
+
 ---
 
 ## Guide for Creators, Journalists, and Activists
@@ -115,6 +125,27 @@ The signed receipt commits to the canonical URL, platform post id, source SHA-25
 
 At 1080×1080, the raw RGB LSB capacity is about 427 KiB; the encoder grows the canvas automatically until the compressed frame fits.
 
+### 5. Command console and guided tour
+
+The input above the workspace is a keyboard-first shortcut layer over the existing controls. It never replaces them—every button and diagnostic remains in the DOM and reachable.
+
+| Command | Action |
+|---|---|
+| `/help` | Show the short command list |
+| `/join [topics]` · `/leave` | Start or stop live signaling |
+| `/post <text>` · `/seal` | Load a draft or mine and seal it |
+| `/video` · `/import` | Choose a Reel video or a stego PNG carrier |
+| `/export` | Export a self-replicating Quine |
+| `/filter all\|2hop\|pow` | Switch the feed filter |
+| `/receipt <url>` | Load a Hydra receipt draft |
+| `/vault` · `/bridge` | Open the key vault or manual SDP bridge |
+| `/status` · `/diagnostics` · `/trace` · `/clear` | Inspect state, hide/show the protocol trace, or clear it |
+| `/guide` | Open the nine-step interactive tour |
+
+Use the up/down arrow keys to recall prior commands. **hide diagnostics** collapses the right-hand protocol panels with CSS (`diagnostics-hidden`) and keeps their nodes intact, so automated selectors and screen readers still find them.
+
+Press **guide** for the interactive tour. It covers identity, discovery, publishing, video, the feed, offline carriers, the command console, and the prototype caveats. The tour highlights the relevant control without changing its state.
+
 ---
 
 ## Threat Model
@@ -125,6 +156,7 @@ SPORE assumes a hostile network, unreliable hosting, and platforms that may remo
 |---|---|---|---|
 | **DNS / SNI blocking and HTTP 451** | Resolvers and middleboxes can block a domain or drop traffic in milliseconds. | The application, cryptography, feed, stego decoder, and Quine hydration work with no network. There is no required origin. Live discovery uses BitTorrent WebSocket trackers, Nostr relays, and a Manual Offline SDP Copy-Paste Bridge. | A total egress block prevents live discovery. Mirrors can still be blocked. There is no domain fronting or built-in covert channel; offline carriers still work. |
 | **App-store and platform takedowns** | Stores can remove apps on legal request; platforms can delete posts or accounts. | SPORE is not an app-store listing. It is a single HTML document that can be mirrored, emailed, carried on USB, or sent over a messenger. Quines embed verified packets; PNG carriers embed signed packets; Hydra receipts commit before removal. | File sharing can be blocked, browsers/OSes can restrict local files, and a particular mirror can disappear. There is no automatic update channel unless you distribute a new file. |
+| **Video removal and CDN expiry** | Reels disappear when the host deletes them, rotates a CDN URL, or blocks a region. | Video is sliced into SHA-256-addressed 64 KiB chunks, seeded by peers, and bound to the signed packet through `media_cid`. Clips up to 1.5 MB embed inline in Quines and PNG carriers. | Large clips need a connected or previously seeded peer; hashes prevent byte substitution, not withholding. A total blackout with no carrier leaves only already-cached chunks. |
 | **Signaling choke points** | Blocking one API endpoint or tracker kills a standard WebRTC app. | Two independent Trystero strategies run simultaneously: BitTorrent WebSocket trackers and Nostr relays, each with multiple endpoints. The Manual Offline SDP Copy-Paste Bridge (`spore-peer://…`) needs no tracker or STUN server. | All public relays/trackers can be blocked. The manual bridge needs some reachable path and does not traverse NAT without a direct path. Signaling metadata and direct-peer IPs remain visible. |
 | **First-seeder IP harvesting** | An observer monitoring a DHT or relay can log the first address that announces a controversial packet. | Locally authored packets enter a Dandelion++-style **stem** at `hop_count: 0` and go 1-to-1 to one randomly selected peer over a DTLS-encrypted WebRTC DataChannel. `hop_count` advances toward the 3-hop limit; each hop fluffs with 30% probability, when no stem peers remain, or at hop 3. Fluff then broadcasts to all peers except the sender. Duplicate ids are dropped. | WebRTC's DTLS encryption protects transit, not source anonymity, and SPORE adds no custom application-layer payload encryption. A direct WebRTC peer can learn your IP through ICE; a global observer can correlate traffic. Use a VPN/Tor, the manual bridge, or offline transfer when that matters. |
 | **Sybil and spam floods** | Open P2P networks without central moderators can be flooded with cheap identities. | Every ingress checks schema, packet id, and Schnorr signature, and confirms the digest meets its declared PoW. Unknown authors need a **16-bit** Hashcash floor to appear in the live feed. The 2-hop Web-of-Trust ranks known authors above strangers; mutes are absorbing; storage is bounded and deterministically evicted. | SHA-256 PoW is commodity work, not memory-hard. A funded adversary can buy cycles. Trust is local and subjective, not global consensus. Verified packets carried in an embedded Quine seed are shown with a `SEED` tag even if they fall below the local unknown-author floor. |
@@ -199,6 +231,17 @@ SPORE assumes a hostile network, unreliable hosting, and platforms that may remo
 
 **Counters:** URL takedowns and image-based redistribution. The image is the carrier, but it is **not encryption**—anyone can decode it, and lossy re-encoding destroys the payload.
 
+### P2P video swarm — content-addressed media
+
+- A video is sliced into fixed-size **64 KiB** chunks. Each chunk gets a SHA-256 hash, and the complete binary gets a SHA-256 `media_id`.
+- The manifest records the file name, MIME type, byte length, chunk size, chunk count, per-chunk hashes, an optional source URL, and—for clips up to **1.5 MB**—the complete inline base64 payload.
+- Chunks are cached in IndexedDB object store `spore_video_chunks`, keyed `${media_id}:${chunk_index}`, with an always-on in-memory fallback for `file://` and locked-down origins.
+- Peers announce availability with `MEDIA_HAVE`, request bounded windows with `MEDIA_REQ` (**4–6 chunks**), and answer with `MEDIA_CHUNK`. Every response is length-checked and hash-verified before storage; the assembled blob is verified again against `media_id` before a player receives it.
+- The manifest rides inside the packet, but its `media_id` is bound to the signed `media_cid`. The packet id and signature still cover the original canonical fields; media integrity is enforced by the chunk and full-file hash gates.
+- Inline clips make a feed item self-contained: a Quine or stego PNG can carry the whole video, and playback works offline with zero peers. Larger clips are availability-dependent and need a seeding peer.
+
+**Counters:** file-host takedowns, CDN removal, and byte substitution. A peer can withhold chunks, but it cannot make altered bytes verify.
+
 ### HTML Quine — self-replicating snapshots
 
 - Export clones the running application, strips transient session state (including key displays, passphrases, and backup JSON), and injects a compressed packet set into `<script id="spore-quine-state" type="application/json">`.
@@ -220,7 +263,7 @@ SPORE assumes a hostile network, unreliable hosting, and platforms that may remo
 
 ---
 
-## Phase 6 — Build, Verification, and Single-File Audit
+## Phase 7 — Build, Verification, and Single-File Audit
 
 Requires a current Node.js LTS release.
 
@@ -244,9 +287,9 @@ The Vite + `vite-plugin-singlefile` pipeline inlines the JavaScript and CSS. `di
 At the time of writing:
 
 ```text
-size:     273,621 bytes (~274 KB raw)
-sha256:   5513b4e2b09d40e03d47cf27f2e0a356f7131e51e5f89931f250d737eaa33cdf
-tests:    105 passed across 6 files
+size:     313,049 bytes (~313 KB raw)
+sha256:   add8856085ac14263c5fd99b8e935fc7381a768637a920ff5353e48f867a8ff2
+tests:    121 passed across 7 files
 typecheck: clean
 ```
 
